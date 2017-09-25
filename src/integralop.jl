@@ -143,7 +143,7 @@ function momintegrals!(biop, tshs, bshs, tcell, bcell, z, strat::DoubleQuadStrat
     α = 1.0 + 1.0im
     β = 1.0 + 1.0im
 
-	#Device Initialisation
+    #Device Initialisation
     dev = CuDevice(0)
     ctx = CuContext(dev)
     
