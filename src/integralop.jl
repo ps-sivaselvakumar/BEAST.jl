@@ -1,3 +1,4 @@
+using CUDAdrv, CUDAnative
 abstract type IntegralOperator <: Operator end
 
 export quadrule, elements
@@ -88,6 +89,41 @@ immutable DoubleQuadStrategy{P,Q}
   inner_quad_points::Q
 end
 
+#Kernel
+function kernel(jx, jy, j, len_jx, len_jy, tgeos, bgeos, kernelvals, len_tgeos, len_bgeos, size_tgeos, size_bgeos, γ)
+    
+    m = (blockIdx().x-1) * blockDim().x + threadIdx().x
+	n = (blockIdx().y-1) * blockDim().y + threadIdx().y
+    jID = n + len_jy * (m - 1)
+    kernelID = n + size_bgeos * (m - 1)
+
+    a = 1 + (m - 1) * 3  
+    b = 2 + (m - 1) * 3  
+    c = 3 + (m - 1) * 3
+
+    x = 1 + (n - 1) * 3  
+    y = 2 + (n - 1) * 3  
+    z = 3 + (n - 1) * 3  
+
+    if m <= len_jx 
+        if n <= len_jy       
+            j[jID] = jx[m] * jy[n]
+        end
+    end
+
+    if a <= len_tgeos 
+        if x <= len_bgeos 
+            R = sqrt((tgeos[a] - bgeos[x])^2 + (tgeos[b] - bgeos[y])^2 + (tgeos[c] - bgeos[z])^2)
+            γR = -(R*γ)
+            RealPart = real(γR)
+            ImgPart = imag(γR)
+            numerator = (exp(RealPart))*(CUDAnative.cos(ImgPart) + im*CUDAnative.sin(ImgPart))
+            kernelvals[kernelID] = numerator/(4*pi*R)
+       end
+    end 
+
+    return nothing
+end
 
 """
     regularcellcellinteractions!(biop, tshs, bshs, tcell, bcell, interactions, strat)
@@ -103,32 +139,76 @@ function momintegrals!(biop, tshs, bshs, tcell, bcell, z, strat::DoubleQuadStrat
     wimps = strat.inner_quad_points
 
     M, N = size(z)
-    #Edited
-    for womp in womps
-        tgeo = womp.point
-        tvals = womp.value
-        jx = womp.weight
+    γ = 0.0 + 1.0im
+    α = 1.0 + 1.0im
+    β = 1.0 + 1.0im
 
-        for wimp in wimps
-            bgeo = wimp.point
-            bvals = wimp.value
-            jy = wimp.weight
+	#Device Initialisation
+    dev = CuDevice(0)
+    ctx = CuContext(dev)
+    
+    #Making an array
+    jx = [womp.weight for womp in womps]
+    jy = [wimp.weight for wimp in wimps]
+    tgeos = [womp.point.cart[i] for womp in womps, i = 1:3]
+    bgeos = [wimp.point.cart[i] for wimp in wimps, i = 1:3]
+    t_tgeos = transpose(tgeos)
+    t_bgeos = transpose(bgeos)
+    tvals = [womp.value for womp in womps]
+    bvals = [wimp.value for wimp in wimps]
+    gvalue = [womp.value[i][2] for womp in womps, i = 1:3]
+    g = gvalue[1]
+    fvalue = [wimp.value[i][2] for wimp in wimps, i = 1:3]    
+    f = fvalue[1]
+    ntgeos = [normal(womp.point) for womp in womps] 
+    nx = ntgeos[1]
+    nbgeos = [normal(wimp.point) for wimp in wimps] 
+    ny = nbgeos[1]    
+    αdgf = α*dot(nx, ny)*g*f   
+    
+    #Determining the length of the arrays
+    len_jx = length(jx)  
+    len_jy = length(jy)
+    size_tgeos = size(t_tgeos,2)
+    size_bgeos = size(t_bgeos,2)  
+    len_tgeos = length(t_tgeos)
+    len_bgeos = length(t_bgeos)
+   
+    #From Host to Device
+    d_jx = CuArray(jx)
+    d_jy = CuArray(jy)
+    d_j = CuArray{Float64}(len_jx * len_jy) 
+    d_tgeos = CuArray{Float64,2}(size(t_tgeos))
+    copy!(d_tgeos, t_tgeos)
+    d_bgeos = CuArray{Float64,2}(size(t_bgeos))
+    copy!(d_bgeos, t_bgeos)
+    d_kernelvals = CuArray{Complex{Float64},1}(size_tgeos * size_bgeos)
 
-            j = jx * jy
-            kernel = kernelvals(biop, tgeo, bgeo)
 
-            for m in 1 : M
-                tval = tvals[m]
-                for n in 1 : N
-                    bval = bvals[n]
+    #Kernel launch
+    @cuda ((500,500,1),(1,1,1)) kernel(d_jx, d_jy, d_j, len_jx, len_jy, d_tgeos, d_bgeos, d_kernelvals, len_tgeos, len_bgeos, size_tgeos, size_bgeos, γ)
 
-                    igd = integrand(biop, kernel, tval, tgeo, bval, bgeo)
-                    z[m,n] += j * igd
-                end
+    #Copying back from the device 
+    j = Array(d_j)
+    kernelvals = Array{Complex{Float64},1}(d_kernelvals)
+    
+    for i in 1 : length(j)    
+        for m in 1 : M
+            tval = tvals[m]
+            for n in 1 : N
+                bval = bvals[n]                 
+                
+                g, curlg = tval
+                f, curlf = bval                
+                igd = αdgf + β*dot(curlg[1], curlf[1])
+                z[m,n] += j[i] * kernelvals[i] * igd
+
             end
         end
     end
-
+     
+    synchronize()
+    destroy!(ctx) 
     return z
 end
 
