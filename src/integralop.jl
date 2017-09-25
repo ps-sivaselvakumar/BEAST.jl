@@ -103,7 +103,7 @@ function momintegrals!(biop, tshs, bshs, tcell, bcell, z, strat::DoubleQuadStrat
     wimps = strat.inner_quad_points
 
     M, N = size(z)
-
+    #Edited
     for womp in womps
         tgeo = womp.point
         tvals = womp.value
